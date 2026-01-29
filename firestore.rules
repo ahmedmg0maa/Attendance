@@ -1,0 +1,81 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc(uid) { return get(/databases/$(database)/documents/users/$(uid)); }
+    function myRole() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? userDoc(request.auth.uid).data.role
+        : "guest";
+    }
+    function isOwner() { return myRole() == "owner"; }
+    function isHR() { return myRole() == "hr"; }
+    function isAdmin() { return isOwner() || isHR(); }
+
+    // System meta for first owner bootstrap
+    match /meta/system {
+      allow read: if signedIn() && isAdmin();
+      allow create: if signedIn()
+        && !exists(/databases/$(database)/documents/meta/system)
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.initialized == true;
+      allow update, delete: if false;
+    }
+
+    match /usersByUsername/{username} {
+      allow read: if signedIn() && isAdmin();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // First-time profile creation:
+      // - If meta/system does not exist, user may create themselves as owner AND create meta/system via separate write.
+      // - Otherwise, user may create themselves only as employee. Owner/HR can later update role/salary.
+      allow create: if signedIn() && request.auth.uid == uid
+        && (
+          (!exists(/databases/$(database)/documents/meta/system) && request.resource.data.role == "owner")
+          || (exists(/databases/$(database)/documents/meta/system) && request.resource.data.role == "employee")
+        );
+
+      // Updates:
+      // - User can update limited fields for self (fullName, jobTitle)
+      // - Admin can update any fields (including role/salary/active)
+      allow update: if signedIn() && (
+        (request.auth.uid == uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.username == resource.data.username
+          && request.resource.data.baseSalaryMonthly == resource.data.baseSalaryMonthly
+          && request.resource.data.allowanceFixedMonthly == resource.data.allowanceFixedMonthly
+          && request.resource.data.deductionFixedMonthly == resource.data.deductionFixedMonthly
+          && request.resource.data.overtimeRatePerHour == resource.data.overtimeRatePerHour
+          && request.resource.data.latePenaltyPerMinute == resource.data.latePenaltyPerMinute
+          && request.resource.data.active == resource.data.active
+        )
+        || isAdmin()
+      );
+
+      allow delete: if isOwner();
+    }
+
+    // Attendance records stored per user
+    match /attendance/{uid}/days/{dayKey} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create, update: if signedIn() && request.auth.uid == uid;
+      allow delete: if isOwner();
+    }
+
+    match /shiftPolicy/{docId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isOwner();
+    }
+
+    match /payrollPayments/{uid}/months/{month} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create, update: if signedIn() && (request.auth.uid == uid || isAdmin()); // HR/Owner marks paid; self can create defaults
+      allow delete: if isOwner();
+    }
+  }
+}
